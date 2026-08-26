@@ -1,0 +1,47 @@
+[submodule "apps/ores-otel-api-server.rs"]
+	path = apps/ores-otel-api-server.rs
+	url = https://github.com/ores-otel/ores-otel-api-server.rs.git
+
+[submodule "apps/ores-otel-web-server.rs"]
+	path = apps/ores-otel-web-server.rs
+	url = https://github.com/ores-otel/ores-otel-web-server.rs.git
+
+[submodule "apps/ores-otel-infra"]
+	path = apps/ores-otel-infra
+	url = https://github.com/ores-otel/ores-otel-infra.git
+
+[submodule "apps/ores-otel-lib-core"]
+	path = apps/ores-otel-lib-core
+	url = https://github.com/ores-otel/ores-otel-lib-core.git
+
+[submodule "apps/ores-otel-interfaces"]
+	path = apps/ores-otel-interfaces
+	url = https://github.com/ores-otel/ores-otel-interfaces.git
+
+[submodule "apps/ores-otel-clients"]
+	path = apps/ores-otel-clients
+	url = https://github.com/ores-otel/ores-otel-clients.git
+
+[submodule "apps/ores-otel-cli"]
+	path = apps/ores-otel-cli
+	url = https://github.com/ores-otel/ores-otel-cli.git
+
+[submodule "apps/ores-otel-sync"]
+	path = apps/ores-otel-sync
+	url = https://github.com/ores-otel/ores-otel-sync.git
+
+[submodule "apps/ores-otel-e2e"]
+	path = apps/ores-otel-e2e
+	url = https://github.com/ores-otel/ores-otel-e2e.git
+
+[submodule "apps/ores-otel-flutter"]
+	path = apps/ores-otel-flutter
+	url = https://github.com/ores-otel/ores-otel-flutter.git
+
+[submodule "apps/ores-otel-desktop-app.rs"]
+	path = apps/ores-otel-desktop-app.rs
+	url = https://github.com/ores-otel/ores-otel-desktop-app.rs.git
+
+[submodule "apps/ores-otel-sidecar.rs"]
+	path = apps/ores-otel-sidecar.rs
+	url = https://github.com/ores-otel/ores-otel-sidecar.rs.git

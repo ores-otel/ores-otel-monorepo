@@ -1,0 +1,12 @@
+/target
+/node_modules
+/build
+/.dart_tool
+/coverage
+.DS_Store
+.env
+.env.*
+!.env.example
+*.sqlite
+Cargo.lock
+
