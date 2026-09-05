@@ -10,3 +10,8 @@
 *.sqlite
 Cargo.lock
 
+# Repository-local temporary data and authorized Git worktrees
+tmp
+temp
+tmp/worktrees
+temp/worktrees
