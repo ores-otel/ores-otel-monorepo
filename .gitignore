@@ -10,3 +10,7 @@
 *.sqlite
 Cargo.lock
 
+
+# Local temporary directories and repository-owned worktrees
+tmp/
+temp/
