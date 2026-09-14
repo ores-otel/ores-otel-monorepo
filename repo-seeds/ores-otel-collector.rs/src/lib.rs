@@ -345,10 +345,7 @@ mod tests {
         assert!(authorize(&config(Some("secret")), &headers).is_err());
 
         headers.insert("x-ores-internal-auth", HeaderValue::from_static("secret"));
-        headers.insert(
-            "x-ores-tenant-id",
-            HeaderValue::from_static("tenant space"),
-        );
+        headers.insert("x-ores-tenant-id", HeaderValue::from_static("tenant space"));
         assert!(authorize(&config(Some("secret")), &headers).is_err());
     }
 }
