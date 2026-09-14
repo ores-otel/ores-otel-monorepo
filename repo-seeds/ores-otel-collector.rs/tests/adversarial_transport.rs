@@ -46,6 +46,9 @@ fn query_fragment_and_non_http_schemes_are_rejected() {
         "ftp://collector.example/",
         "file:///tmp/collector",
     ] {
-        assert!(validate_upstream(raw).is_err(), "accepted unsafe upstream {raw}");
+        assert!(
+            validate_upstream(raw).is_err(),
+            "accepted unsafe upstream {raw}"
+        );
     }
 }
