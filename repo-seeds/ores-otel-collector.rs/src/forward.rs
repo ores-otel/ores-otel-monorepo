@@ -11,6 +11,15 @@ pub struct ForwardPolicy {
     pub retry_backoff_ms: u64,
 }
 
+#[derive(Debug)]
+pub struct ForwardRequest<'a> {
+    pub upstream: Url,
+    pub content_type: &'a str,
+    pub tenant_id: &'a str,
+    pub workload_id: &'a str,
+    pub body: Vec<u8>,
+}
+
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
 pub enum ForwardError {
     #[error("upstream request timed out")]
@@ -21,20 +30,16 @@ pub enum ForwardError {
 
 pub async fn post_with_retry(
     client: &Client,
-    upstream: Url,
-    content_type: &str,
-    tenant_id: &str,
-    workload_id: &str,
-    body: Vec<u8>,
+    request: ForwardRequest<'_>,
     policy: ForwardPolicy,
 ) -> Result<Response, ForwardError> {
     for attempt in 1..=policy.max_attempts {
         let result = client
-            .post(upstream.clone())
-            .header(reqwest::header::CONTENT_TYPE, content_type)
-            .header("x-ores-tenant-id", tenant_id)
-            .header("x-ores-workload-id", workload_id)
-            .body(body.clone())
+            .post(request.upstream.clone())
+            .header(reqwest::header::CONTENT_TYPE, request.content_type)
+            .header("x-ores-tenant-id", request.tenant_id)
+            .header("x-ores-workload-id", request.workload_id)
+            .body(request.body.clone())
             .send()
             .await;
 
