@@ -117,10 +117,16 @@ pub fn validate_upstream(raw: &str) -> Result<Url, ConfigError> {
 fn is_loopback_host(url: &Url) -> bool {
     match url.host_str() {
         Some("localhost") => true,
-        Some(host) => host
-            .parse::<IpAddr>()
-            .map(|ip| ip.is_loopback())
-            .unwrap_or(false),
+        Some(host) => {
+            let normalized = host
+                .strip_prefix('[')
+                .and_then(|value| value.strip_suffix(']'))
+                .unwrap_or(host);
+            normalized
+                .parse::<IpAddr>()
+                .map(|ip| ip.is_loopback())
+                .unwrap_or(false)
+        }
         None => false,
     }
 }
