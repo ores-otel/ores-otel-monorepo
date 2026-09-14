@@ -131,7 +131,10 @@ mod tests {
                 retry_after_ms: 500
             }
         );
-        assert_eq!(table.admit_at("tenant_a", 499), QuotaDecision::RateLimited { retry_after_ms: 1 });
+        assert_eq!(
+            table.admit_at("tenant_a", 499),
+            QuotaDecision::RateLimited { retry_after_ms: 1 }
+        );
         assert_eq!(table.admit_at("tenant_a", 500), QuotaDecision::Allowed);
     }
 
