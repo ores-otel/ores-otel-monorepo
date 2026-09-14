@@ -27,7 +27,7 @@ pub mod forward;
 pub mod quota;
 
 use compression::{decode_bounded, DecodeError};
-use forward::{post_with_retry, ForwardError, ForwardPolicy};
+use forward::{post_with_retry, ForwardError, ForwardPolicy, ForwardRequest};
 use quota::{QuotaConfig, QuotaDecision, TenantQuotaGate};
 
 pub const DEFAULT_MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
@@ -356,11 +356,13 @@ async fn ingest(
 
     let response = match post_with_retry(
         &state.client,
-        upstream,
-        &content_type,
-        &tenant_id,
-        &workload_id,
-        bytes,
+        ForwardRequest {
+            upstream,
+            content_type: &content_type,
+            tenant_id: &tenant_id,
+            workload_id: &workload_id,
+            body: bytes,
+        },
         state.config.forward_policy(),
     )
     .await
