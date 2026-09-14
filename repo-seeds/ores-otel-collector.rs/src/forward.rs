@@ -45,11 +45,11 @@ pub async fn post_with_retry(
                 tokio::time::sleep(retry_delay(policy.retry_backoff_ms, attempt)).await;
             }
             Ok(response) => return Ok(response),
-            Err(error) if attempt < policy.max_attempts => {
+            Err(error) if error.is_builder() || error.is_redirect() => {
+                return Err(ForwardError::Network);
+            }
+            Err(_) if attempt < policy.max_attempts => {
                 tokio::time::sleep(retry_delay(policy.retry_backoff_ms, attempt)).await;
-                if error.is_builder() || error.is_redirect() {
-                    return Err(ForwardError::Network);
-                }
             }
             Err(error) if error.is_timeout() => return Err(ForwardError::Timeout),
             Err(_) => return Err(ForwardError::Network),
