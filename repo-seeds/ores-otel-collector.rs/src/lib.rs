@@ -21,6 +21,10 @@ use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::sync::Semaphore;
 
+pub mod compression;
+
+use compression::{decode_bounded, DecodeError};
+
 pub const DEFAULT_MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 pub const HARD_MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_MAX_CONCURRENT: usize = 64;
@@ -199,21 +203,53 @@ async fn ingest(
             )
         }
     };
-    if headers.get(CONTENT_ENCODING).is_some() {
-        return error(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "compressed_otlp_not_yet_supported",
-        );
-    }
+    let content_encoding = match headers.get(CONTENT_ENCODING) {
+        Some(value) => match value.to_str() {
+            Ok(value) => Some(value.to_owned()),
+            Err(_) => {
+                return error(
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    "invalid_content_encoding",
+                )
+            }
+        },
+        None => None,
+    };
 
     let _permit = match state.permits.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => return error(StatusCode::TOO_MANY_REQUESTS, "collector_overloaded"),
     };
 
-    let bytes = match to_bytes(body, state.config.max_body_bytes).await {
+    let encoded = match to_bytes(body, state.config.max_body_bytes).await {
         Ok(bytes) => bytes,
         Err(_) => return error(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large"),
+    };
+    let max_body_bytes = state.config.max_body_bytes;
+    let bytes = match tokio::task::spawn_blocking(move || {
+        decode_bounded(content_encoding.as_deref(), &encoded, max_body_bytes)
+    })
+    .await
+    {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(DecodeError::UnsupportedEncoding)) => {
+            return error(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "unsupported_content_encoding",
+            )
+        }
+        Ok(Err(DecodeError::InvalidGzip)) => {
+            return error(StatusCode::BAD_REQUEST, "invalid_gzip_payload")
+        }
+        Ok(Err(DecodeError::PayloadTooLarge)) => {
+            return error(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large")
+        }
+        Err(_) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "decompression_task_failed",
+            )
+        }
     };
 
     let upstream = match state
