@@ -8,7 +8,7 @@ use axum::{
     body::{to_bytes, Body},
     extract::{OriginalUri, State},
     http::{
-        header::{CONTENT_ENCODING, CONTENT_TYPE},
+        header::{CONTENT_ENCODING, CONTENT_TYPE, RETRY_AFTER},
         HeaderMap, StatusCode,
     },
     response::{IntoResponse, Response},
@@ -22,12 +22,17 @@ use thiserror::Error;
 use tokio::sync::Semaphore;
 
 pub mod compression;
+pub mod quota;
 
 use compression::{decode_bounded, DecodeError};
+use quota::{QuotaConfig, QuotaDecision, TenantQuotaGate};
 
 pub const DEFAULT_MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 pub const HARD_MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_MAX_CONCURRENT: usize = 64;
+pub const DEFAULT_TENANT_RATE_PER_SEC: u32 = 100;
+pub const DEFAULT_TENANT_BURST: u32 = 200;
+pub const DEFAULT_MAX_TENANT_BUCKETS: usize = 4096;
 const MAX_UPSTREAM_RESPONSE_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone)]
@@ -37,6 +42,9 @@ pub struct Config {
     pub internal_auth: Option<String>,
     pub max_body_bytes: usize,
     pub max_concurrent: usize,
+    pub tenant_rate_per_sec: u32,
+    pub tenant_burst: u32,
+    pub max_tenant_buckets: usize,
 }
 
 #[derive(Debug, Error)]
@@ -74,13 +82,42 @@ impl Config {
         )?;
         let max_concurrent =
             parse_bounded_env("ORES_OTEL_MAX_CONCURRENT", DEFAULT_MAX_CONCURRENT, 1, 4096)?;
+        let tenant_rate_per_sec = parse_bounded_env(
+            "ORES_OTEL_TENANT_RATE_PER_SEC",
+            DEFAULT_TENANT_RATE_PER_SEC as usize,
+            1,
+            100_000,
+        )? as u32;
+        let tenant_burst = parse_bounded_env(
+            "ORES_OTEL_TENANT_BURST",
+            DEFAULT_TENANT_BURST as usize,
+            1,
+            1_000_000,
+        )? as u32;
+        let max_tenant_buckets = parse_bounded_env(
+            "ORES_OTEL_MAX_TENANT_BUCKETS",
+            DEFAULT_MAX_TENANT_BUCKETS,
+            1,
+            1_000_000,
+        )?;
         Ok(Self {
             bind,
             upstream_base,
             internal_auth,
             max_body_bytes,
             max_concurrent,
+            tenant_rate_per_sec,
+            tenant_burst,
+            max_tenant_buckets,
         })
+    }
+
+    fn quota_config(&self) -> QuotaConfig {
+        QuotaConfig {
+            rate_per_second: self.tenant_rate_per_sec,
+            burst: self.tenant_burst,
+            max_tenants: self.max_tenant_buckets,
+        }
     }
 }
 
@@ -156,11 +193,13 @@ struct CollectorState {
     config: Config,
     client: reqwest::Client,
     permits: Arc<Semaphore>,
+    quota: Arc<TenantQuotaGate>,
 }
 
 pub fn router(config: Config) -> Router {
     let state = CollectorState {
         permits: Arc::new(Semaphore::new(config.max_concurrent)),
+        quota: Arc::new(TenantQuotaGate::new(config.quota_config())),
         config,
         client: reqwest::Client::new(),
     };
@@ -189,6 +228,19 @@ async fn ingest(
         Err(request_error) => return request_error.into_response(),
     };
 
+    match state.quota.admit(&tenant_id) {
+        QuotaDecision::Allowed => {}
+        QuotaDecision::RateLimited { retry_after_ms } => {
+            return rate_limited(retry_after_ms);
+        }
+        QuotaDecision::TenantTableFull => {
+            return error(StatusCode::SERVICE_UNAVAILABLE, "tenant_quota_table_full");
+        }
+        QuotaDecision::Unavailable => {
+            return error(StatusCode::SERVICE_UNAVAILABLE, "tenant_quota_unavailable");
+        }
+    }
+
     let content_type = match headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok()) {
         Some(value)
             if value.starts_with("application/x-protobuf")
@@ -210,7 +262,7 @@ async fn ingest(
                 return error(
                     StatusCode::UNSUPPORTED_MEDIA_TYPE,
                     "invalid_content_encoding",
-                )
+                );
             }
         },
         None => None,
@@ -236,19 +288,19 @@ async fn ingest(
             return error(
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
                 "unsupported_content_encoding",
-            )
+            );
         }
         Ok(Err(DecodeError::InvalidGzip)) => {
-            return error(StatusCode::BAD_REQUEST, "invalid_gzip_payload")
+            return error(StatusCode::BAD_REQUEST, "invalid_gzip_payload");
         }
         Ok(Err(DecodeError::PayloadTooLarge)) => {
-            return error(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large")
+            return error(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large");
         }
         Err(_) => {
             return error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "decompression_task_failed",
-            )
+            );
         }
     };
 
@@ -335,6 +387,18 @@ fn required_identity(headers: &HeaderMap, name: &'static str) -> Result<String, 
     Ok(value.to_owned())
 }
 
+fn rate_limited(retry_after_ms: u64) -> Response {
+    let retry_after_seconds = retry_after_ms.saturating_add(999) / 1000;
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [(RETRY_AFTER, retry_after_seconds.max(1).to_string())],
+        axum::Json(ErrorBody {
+            error: "tenant_rate_limited",
+        }),
+    )
+        .into_response()
+}
+
 fn error(status: StatusCode, code: &'static str) -> Response {
     (status, axum::Json(ErrorBody { error: code })).into_response()
 }
@@ -351,6 +415,9 @@ mod tests {
             internal_auth: secret.map(str::to_owned),
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             max_concurrent: 2,
+            tenant_rate_per_sec: 10,
+            tenant_burst: 20,
+            max_tenant_buckets: 8,
         }
     }
 
