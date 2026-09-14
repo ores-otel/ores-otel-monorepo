@@ -12,7 +12,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
     let bind = config.bind;
     let listener = tokio::net::TcpListener::bind(bind).await?;
-    axum::serve(listener, router(config)).with_graceful_shutdown(shutdown()).await?;
+    axum::serve(listener, router(config))
+        .with_graceful_shutdown(shutdown())
+        .await?;
     Ok(())
 }
 
