@@ -1,0 +1,14 @@
+[package]
+name = "ores-otel-collector"
+version = "0.1.0"
+edition = "2021"
+description = "Bounded authenticated OTLP/HTTP ingest and forwarding plane for ORES OTEL"
+license = "MIT"
+
+[dependencies]
+axum = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+subtle = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync"] }
