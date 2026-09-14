@@ -125,6 +125,22 @@ fn is_loopback_host(url: &Url) -> bool {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RequestError {
+    status: StatusCode,
+    code: &'static str,
+}
+
+impl RequestError {
+    const fn new(status: StatusCode, code: &'static str) -> Self {
+        Self { status, code }
+    }
+
+    fn into_response(self) -> Response {
+        error(self.status, self.code)
+    }
+}
+
 #[derive(Clone)]
 struct CollectorState {
     config: Config,
@@ -160,7 +176,7 @@ async fn ingest(
 ) -> Response {
     let (tenant_id, workload_id) = match authorize(&state.config, &headers) {
         Ok(scope) => scope,
-        Err(response) => return response,
+        Err(request_error) => return request_error.into_response(),
     };
 
     let content_type = match headers.get(CONTENT_TYPE).and_then(|v| v.to_str().ok()) {
@@ -234,16 +250,22 @@ async fn ingest(
         .unwrap_or_else(|_| error(StatusCode::BAD_GATEWAY, "response_build_failed"))
 }
 
-fn authorize(config: &Config, headers: &HeaderMap) -> Result<(String, String), Response> {
+fn authorize(config: &Config, headers: &HeaderMap) -> Result<(String, String), RequestError> {
     if let Some(expected) = config.internal_auth.as_deref() {
         let Some(actual) = headers
             .get("x-ores-internal-auth")
             .and_then(|v| v.to_str().ok())
         else {
-            return Err(error(StatusCode::UNAUTHORIZED, "missing_internal_auth"));
+            return Err(RequestError::new(
+                StatusCode::UNAUTHORIZED,
+                "missing_internal_auth",
+            ));
         };
         if expected.as_bytes().ct_eq(actual.as_bytes()).unwrap_u8() != 1 {
-            return Err(error(StatusCode::UNAUTHORIZED, "invalid_internal_auth"));
+            return Err(RequestError::new(
+                StatusCode::UNAUTHORIZED,
+                "invalid_internal_auth",
+            ));
         }
     }
 
@@ -252,18 +274,21 @@ fn authorize(config: &Config, headers: &HeaderMap) -> Result<(String, String), R
     Ok((tenant_id, workload_id))
 }
 
-fn required_identity(headers: &HeaderMap, name: &'static str) -> Result<String, Response> {
+fn required_identity(headers: &HeaderMap, name: &'static str) -> Result<String, RequestError> {
     let value = headers
         .get(name)
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| error(StatusCode::BAD_REQUEST, "missing_scope_header"))?;
+        .ok_or_else(|| RequestError::new(StatusCode::BAD_REQUEST, "missing_scope_header"))?;
     if value.is_empty()
         || value.len() > 128
         || !value
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
     {
-        return Err(error(StatusCode::BAD_REQUEST, "invalid_scope_header"));
+        return Err(RequestError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_scope_header",
+        ));
     }
     Ok(value.to_owned())
 }
