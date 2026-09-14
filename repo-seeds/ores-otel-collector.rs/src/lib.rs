@@ -2,6 +2,7 @@ use std::{
     env,
     net::{IpAddr, SocketAddr},
     sync::Arc,
+    time::Duration,
 };
 
 use axum::{
@@ -22,9 +23,11 @@ use thiserror::Error;
 use tokio::sync::Semaphore;
 
 pub mod compression;
+pub mod forward;
 pub mod quota;
 
 use compression::{decode_bounded, DecodeError};
+use forward::{post_with_retry, ForwardError, ForwardPolicy, ForwardRequest};
 use quota::{QuotaConfig, QuotaDecision, TenantQuotaGate};
 
 pub const DEFAULT_MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
@@ -33,6 +36,9 @@ pub const DEFAULT_MAX_CONCURRENT: usize = 64;
 pub const DEFAULT_TENANT_RATE_PER_SEC: u32 = 100;
 pub const DEFAULT_TENANT_BURST: u32 = 200;
 pub const DEFAULT_MAX_TENANT_BUCKETS: usize = 4096;
+pub const DEFAULT_UPSTREAM_TIMEOUT_MS: u64 = 10_000;
+pub const DEFAULT_UPSTREAM_MAX_ATTEMPTS: u8 = 3;
+pub const DEFAULT_UPSTREAM_RETRY_BACKOFF_MS: u64 = 100;
 const MAX_UPSTREAM_RESPONSE_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone)]
@@ -45,6 +51,9 @@ pub struct Config {
     pub tenant_rate_per_sec: u32,
     pub tenant_burst: u32,
     pub max_tenant_buckets: usize,
+    pub upstream_timeout_ms: u64,
+    pub upstream_max_attempts: u8,
+    pub upstream_retry_backoff_ms: u64,
 }
 
 #[derive(Debug, Error)]
@@ -100,6 +109,24 @@ impl Config {
             1,
             1_000_000,
         )?;
+        let upstream_timeout_ms = parse_bounded_env(
+            "ORES_OTEL_UPSTREAM_TIMEOUT_MS",
+            DEFAULT_UPSTREAM_TIMEOUT_MS as usize,
+            100,
+            300_000,
+        )? as u64;
+        let upstream_max_attempts = parse_bounded_env(
+            "ORES_OTEL_UPSTREAM_MAX_ATTEMPTS",
+            DEFAULT_UPSTREAM_MAX_ATTEMPTS as usize,
+            1,
+            5,
+        )? as u8;
+        let upstream_retry_backoff_ms = parse_bounded_env(
+            "ORES_OTEL_UPSTREAM_RETRY_BACKOFF_MS",
+            DEFAULT_UPSTREAM_RETRY_BACKOFF_MS as usize,
+            1,
+            forward::MAX_RETRY_BACKOFF_MS as usize,
+        )? as u64;
         Ok(Self {
             bind,
             upstream_base,
@@ -109,6 +136,9 @@ impl Config {
             tenant_rate_per_sec,
             tenant_burst,
             max_tenant_buckets,
+            upstream_timeout_ms,
+            upstream_max_attempts,
+            upstream_retry_backoff_ms,
         })
     }
 
@@ -117,6 +147,13 @@ impl Config {
             rate_per_second: self.tenant_rate_per_sec,
             burst: self.tenant_burst,
             max_tenants: self.max_tenant_buckets,
+        }
+    }
+
+    fn forward_policy(&self) -> ForwardPolicy {
+        ForwardPolicy {
+            max_attempts: self.upstream_max_attempts,
+            retry_backoff_ms: self.upstream_retry_backoff_ms,
         }
     }
 }
@@ -197,11 +234,15 @@ struct CollectorState {
 }
 
 pub fn router(config: Config) -> Router {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(config.upstream_timeout_ms))
+        .build()
+        .expect("validated collector HTTP client configuration must build");
     let state = CollectorState {
         permits: Arc::new(Semaphore::new(config.max_concurrent)),
         quota: Arc::new(TenantQuotaGate::new(config.quota_config())),
         config,
-        client: reqwest::Client::new(),
+        client,
     };
     Router::new()
         .route("/healthz", get(|| async { StatusCode::OK }))
@@ -313,18 +354,26 @@ async fn ingest(
         Err(_) => return error(StatusCode::BAD_GATEWAY, "invalid_upstream_route"),
     };
 
-    let response = match state
-        .client
-        .post(upstream)
-        .header(CONTENT_TYPE, content_type)
-        .header("x-ores-tenant-id", tenant_id)
-        .header("x-ores-workload-id", workload_id)
-        .body(bytes)
-        .send()
-        .await
+    let response = match post_with_retry(
+        &state.client,
+        ForwardRequest {
+            upstream,
+            content_type: &content_type,
+            tenant_id: &tenant_id,
+            workload_id: &workload_id,
+            body: bytes,
+        },
+        state.config.forward_policy(),
+    )
+    .await
     {
         Ok(response) => response,
-        Err(_) => return error(StatusCode::BAD_GATEWAY, "upstream_unavailable"),
+        Err(ForwardError::Timeout) => {
+            return error(StatusCode::GATEWAY_TIMEOUT, "upstream_timeout");
+        }
+        Err(ForwardError::Network) => {
+            return error(StatusCode::BAD_GATEWAY, "upstream_unavailable");
+        }
     };
 
     let status =
@@ -418,6 +467,9 @@ mod tests {
             tenant_rate_per_sec: 10,
             tenant_burst: 20,
             max_tenant_buckets: 8,
+            upstream_timeout_ms: 1_000,
+            upstream_max_attempts: 3,
+            upstream_retry_backoff_ms: 10,
         }
     }
 
