@@ -56,10 +56,7 @@ mod tests {
     #[test]
     fn identity_round_trips() {
         assert_eq!(decode_bounded(None, b"abc", 3).unwrap(), b"abc");
-        assert_eq!(
-            decode_bounded(Some("identity"), b"abc", 3).unwrap(),
-            b"abc"
-        );
+        assert_eq!(decode_bounded(Some("identity"), b"abc", 3).unwrap(), b"abc");
     }
 
     #[test]
