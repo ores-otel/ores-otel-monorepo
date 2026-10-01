@@ -1,0 +1,24 @@
+name: ORES static trace/routine contract
+description: Validate grep-stable ORES trace and routine identifiers without adding dependencies.
+inputs:
+  root:
+    description: Source tree to scan
+    required: false
+    default: .
+runs:
+  using: composite
+  steps:
+    - name: Self-test ORES static identifier contract
+      shell: bash
+      run: |
+        set -euo pipefail
+        rustc --edition=2021 -D warnings --test           -o "$RUNNER_TEMP/ores-trace-contract-test"           "$GITHUB_ACTION_PATH/ores-trace-contract.rs"
+        "$RUNNER_TEMP/ores-trace-contract-test"
+    - name: Validate ORES static identifier contract
+      shell: bash
+      env:
+        ORES_CONTRACT_ROOT: ${{ inputs.root }}
+      run: |
+        set -euo pipefail
+        rustc --edition=2021 -D warnings -O           -o "$RUNNER_TEMP/ores-trace-contract"           "$GITHUB_ACTION_PATH/ores-trace-contract.rs"
+        "$RUNNER_TEMP/ores-trace-contract" "$GITHUB_WORKSPACE/$ORES_CONTRACT_ROOT"
