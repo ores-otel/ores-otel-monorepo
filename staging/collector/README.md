@@ -8,8 +8,8 @@ This is a **temporary Rust source bootstrap** attached to an app-of-apps reposit
 - Receives **OTLP/HTTP JSON only** (not protobuf or gRPC). It performs minimal shape/size admission, not complete OTLP semantic-convention or protocol validation.
 - Uses an **ingest-only, static test bearer** to derive one configured tenant; client-provided `x-ores-tenant-id` is rejected. For production: replace the static bearer with authenticated, rotating workload/tenant identity and per-tenant quotas.
 - Body maximum 64 KiB, shallow structure limits, at most 256 signal records, at most eight in-flight exports, 3s exporter timeout and no network redirect. Rejects known secret-bearing attribute names before forwarding. This is **rejection**, not comprehensive policy-based secret redaction.
-- Forwards to exactly one **configured approved HTTPS endpoint** (or test loopback HTTP) with a separate export bearer and an authenticated `x-ores-tenant-id` header; no client-supplied destination accepted.
-- Only responds HTTP 200 after the downstream exporter responds HTTP 200; otherwise 503, without claiming durable acceptance. No queue or retry: callers must own any retry and its idempotency contract.
+- Forwards to exactly one **configured approved HTTPS endpoint** (or test loopback HTTP) with a separate export bearer and an authenticated `x-ores-tenant-id` header; no client-supplied destination accepted, redirects and ambient HTTP proxies disabled. Rejects duplicate authorization/content-type headers and tenant authority attributes.
+- The receiver relays successful exporter acceptance. A downstream OTLP HTTP 200 **with `partialSuccess`** is propagated as a sanitized **200 partial success**, not converted to 503: per OTLP, clients MUST NOT retry partial-success batches because some records may already have been accepted. An invalid successful exporter receipt fails with 502; other exporter failures and timeouts return 503. Neither 502 nor 503 proves that an upstream exporter accepted zero records. No durable queue, replay protection or retry is implemented.
 
 ## Execution
 
@@ -30,7 +30,7 @@ The exporter must be started separately on loopback. The production deployment m
 
 ## Explicitly NOT IMPLEMENTED or NOT CERTIFIED
 
-- OTLP/gRPC, OTLP protobuf, gzip streaming/decompression/size budgets; standard OTLP partial-success negotiation; full schema/semantic-convention validation.
+- OTLP/gRPC, OTLP protobuf, gzip streaming/decompression/size budgets; full standard OTLP partial-success negotiation (only sanitized JSON partial-success rejection counts are supported); complete schema/semantic-convention validation.
 - Multi-tenant identity control plane, credential rotation, mTLS, workload binding, quota/rate budgets, exporter fan-out, per-tenant durability or long-term storage.
 - Complete redaction, retention, query APIs, indexes, analytics, dashboards, automatic instrumentation or Cloudflare Workers native telemetry integration.
 - Retry, persistent queue, shutdown drain, crash recovery, at-least-once/exactly-once delivery, exporter deduplication, secure metrics/health deployment.
