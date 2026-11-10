@@ -180,7 +180,7 @@ async fn ingest(
                     _ => return denied(StatusCode::BAD_GATEWAY),
                 }
             }
-            if !receipt.is_empty() && !upstream_json {
+            if !upstream_json {
                 return denied(StatusCode::BAD_GATEWAY);
             }
             match exporter_receipt(&receipt, signal) {
@@ -202,7 +202,7 @@ async fn ingest(
 // The exact accepted count is never inferred from a 200 response alone.
 fn exporter_receipt(receipt: &[u8], signal: &str) -> Option<Option<Value>> {
     if receipt.is_empty() {
-        return Some(None); // compatibility for test sinks without response bodies
+        return None; // OTLP/HTTP 200 requires a signal-specific response message
     }
     let message: Value = serde_json::from_slice(receipt).ok()?;
     let obj = message.as_object()?;
@@ -314,7 +314,7 @@ mod tests {
     #[test]
     fn preserves_sanitized_otlp_partial_success_without_retries() {
         assert_eq!(exporter_receipt(b"{}", "logs"), Some(None));
-        assert_eq!(exporter_receipt(b"", "logs"), Some(None));
+        assert_eq!(exporter_receipt(b"", "logs"), None);
         assert_eq!(
             exporter_receipt(br#"{"partialSuccess":{"rejectedSpans":2,"errorMessage":"private detail"}}"#, "traces"),
             Some(Some(json!({"rejectedSpans":"2","errorMessage":"upstream exporter warning or partial rejection"})))
