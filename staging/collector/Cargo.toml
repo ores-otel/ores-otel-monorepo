@@ -2,7 +2,7 @@
 name = "ores-otel-collector-staging"
 version = "0.0.1"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.95"
 publish = false
 
 [dependencies]
