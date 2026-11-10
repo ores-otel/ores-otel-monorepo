@@ -63,7 +63,7 @@ fn event(signal: &str) -> Value {
         _ => panic!("invalid test signal"),
     }
 }
-async fn post(client: &Client, url: &str, signal: &str, bearer: Option<&str>, body: String) -> reqwest::Response {
+async fn send_otlp(client: &Client, url: &str, signal: &str, bearer: Option<&str>, body: String) -> reqwest::Response {
     let mut req = client.post(format!("{url}/v1/{signal}")).header("content-type", "application/json").body(body);
     if let Some(token) = bearer { req = req.bearer_auth(token); }
     req.send().await.unwrap()
@@ -74,7 +74,7 @@ async fn real_tcp_all_signals_forward_once_with_trusted_tenant() {
     let (base, sink, export_task, collector_task) = setup(false).await;
     let client = Client::new();
     for signal in ["logs", "traces", "metrics"] {
-        let res = post(&client, &base, signal, Some(CLIENT_BEARER), event(signal).to_string()).await;
+        let res = send_otlp(&client, &base, signal, Some(CLIENT_BEARER), event(signal).to_string()).await;
         assert_eq!(res.status(), StatusCode::OK);
     }
     let calls = sink.calls.lock().unwrap();
@@ -91,17 +91,17 @@ async fn real_tcp_denies_anonymous_forged_tenant_secret_and_malformed() {
     let (base, sink, export_task, collector_task) = setup(false).await;
     let client = Client::new();
     let body = event("logs").to_string();
-    assert_eq!(post(&client, &base, "logs", None, body.clone()).await.status(), StatusCode::UNAUTHORIZED);
-    assert_eq!(post(&client, &base, "logs", Some("wrong-token"), body.clone()).await.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(send_otlp(&client, &base, "logs", None, body.clone()).await.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(send_otlp(&client, &base, "logs", Some("wrong-token"), body.clone()).await.status(), StatusCode::UNAUTHORIZED);
     let spoof = client.post(format!("{base}/v1/logs"))
         .bearer_auth(CLIENT_BEARER).header("content-type", "application/json")
         .header("x-ores-tenant-id", "tenant_b").body(body.clone()).send().await.unwrap();
     assert_eq!(spoof.status(), StatusCode::FORBIDDEN);
-    assert_eq!(post(&client, &base, "logs", Some(CLIENT_BEARER), "{".into()).await.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(send_otlp(&client, &base, "logs", Some(CLIENT_BEARER), "{".into()).await.status(), StatusCode::BAD_REQUEST);
     let bad = json!({"resourceLogs":[{"scopeLogs":[{"logRecords":[{
         "attributes":[{"key":"http.request.header.authorization","value":{"stringValue":"should-not-leak"}}]
     }]}]}]});
-    assert_eq!(post(&client, &base, "logs", Some(CLIENT_BEARER), bad.to_string()).await.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(send_otlp(&client, &base, "logs", Some(CLIENT_BEARER), bad.to_string()).await.status(), StatusCode::BAD_REQUEST);
     assert_eq!(sink.calls.lock().unwrap().len(), 0);
     export_task.abort();
     collector_task.abort();
@@ -111,14 +111,14 @@ async fn real_tcp_denies_anonymous_forged_tenant_secret_and_malformed() {
 async fn real_tcp_does_not_ack_on_export_failure_or_unsupported_encoding() {
     let (base, sink, export_task, collector_task) = setup(true).await;
     let client = Client::new();
-    let res = post(&client, &base, "traces", Some(CLIENT_BEARER), event("traces").to_string()).await;
+    let res = send_otlp(&client, &base, "traces", Some(CLIENT_BEARER), event("traces").to_string()).await;
     assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
     let compressed = client.post(format!("{base}/v1/logs"))
         .bearer_auth(CLIENT_BEARER).header("content-type", "application/json")
         .header("content-encoding", "gzip").body(event("logs").to_string()).send().await.unwrap();
     assert_eq!(compressed.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
     let giant = json!({"resourceLogs":[{"scopeLogs":[{"logRecords":[{"body":{"stringValue":"a".repeat(70000)}}]}]}]});
-    let reject = post(&client, &base, "logs", Some(CLIENT_BEARER), giant.to_string()).await;
+    let reject = send_otlp(&client, &base, "logs", Some(CLIENT_BEARER), giant.to_string()).await;
     assert_eq!(reject.status(), StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(sink.calls.lock().unwrap().len(), 1);
     export_task.abort();
