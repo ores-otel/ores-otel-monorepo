@@ -161,11 +161,14 @@ async fn ingest(
             // Never trust an HTTP 200 as proof of full acceptance: OTLP partial
             // success has 200 status, and must NOT trigger a retry of accepted data.
             // Bound the complete exporter response before any JSON decoding.
-            let upstream_ct = response.headers().get(header::CONTENT_TYPE)
-                .and_then(|header| header.to_str().ok()).unwrap_or("");
-            let upstream_encoding = response.headers().get(header::CONTENT_ENCODING)
-                .and_then(|header| header.to_str().ok()).unwrap_or("identity");
-            if !matches!(upstream_encoding, "identity" | "") {
+            let upstream_json = response.headers().get(header::CONTENT_TYPE)
+                .and_then(|header| header.to_str().ok())
+                .is_some_and(|ct| ct.eq_ignore_ascii_case("application/json")
+                    || ct.to_ascii_lowercase().starts_with("application/json;"));
+            let encoding_ok = response.headers().get(header::CONTENT_ENCODING)
+                .and_then(|header| header.to_str().ok())
+                .is_none_or(|encoding| encoding.eq_ignore_ascii_case("identity"));
+            if !encoding_ok {
                 return denied(StatusCode::BAD_GATEWAY);
             }
             let mut receipt = Vec::new();
@@ -177,7 +180,7 @@ async fn ingest(
                     _ => return denied(StatusCode::BAD_GATEWAY),
                 }
             }
-            if !receipt.is_empty() && !upstream_ct.to_ascii_lowercase().starts_with("application/json") {
+            if !receipt.is_empty() && !upstream_json {
                 return denied(StatusCode::BAD_GATEWAY);
             }
             match exporter_receipt(&receipt, signal) {
