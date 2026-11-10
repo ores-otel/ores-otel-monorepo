@@ -13,7 +13,7 @@ This is a **temporary Rust source bootstrap** attached to an app-of-apps reposit
 
 ## Execution
 
-Requires Rust and Cargo; use `cargo test --manifest-path staging/collector/Cargo.toml --all-targets` to execute real-loopback-TCP integration tests.
+Requires Rust 1.95 and Cargo; the **committed `Cargo.lock`** pins 145 packages. Use `cargo +1.95.0 test --manifest-path staging/collector/Cargo.toml --locked --all-targets` and `cargo +1.95.0 clippy --manifest-path staging/collector/Cargo.toml --locked --all-targets -- -D warnings` to execute real-loopback-TCP and strict lint gates.
 
 Explicit local-only smoke configuration:
 
@@ -36,6 +36,6 @@ The exporter must be started separately on loopback. The production deployment m
 - Retry, persistent queue, shutdown drain, crash recovery, at-least-once/exactly-once delivery, exporter deduplication, secure metrics/health deployment.
 - AttoLang compiler-produced guest execution and Java/LLVM/Forge/Wasm/.NET parity.
 
-CI success here is **NATIVE_HOST_STAGING_ONLY**. For release, create the dedicated repository, commit and review a deterministic Cargo.lock, run negative controls with two real tenants, execute standard OTLP interoperability fixtures and independent export/storage read-back, and capture exact source SHA, stepful jobs and deployment digests.
+CI success here is **NATIVE_HOST_STAGING_ONLY**. For release, create the dedicated repository, review and retain the committed deterministic Cargo.lock, run negative controls with two real tenants, execute standard OTLP interoperability fixtures and independent export/storage read-back, and capture exact source SHA, stepful jobs and deployment digests.
 
 See [draft observability parity ADR](https://github.com/ores-otel/ores-otel-docs/pull/8) and [e2e OTLP admission gate](https://github.com/ores-otel/ores-otel-e2e/pull/8).
