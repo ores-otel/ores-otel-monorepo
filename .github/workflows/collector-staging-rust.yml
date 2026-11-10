@@ -1,0 +1,36 @@
+name: Staging OTLP collector Rust/TCP proof
+on:
+  pull_request:
+    paths:
+      - 'staging/collector/**'
+      - '.github/workflows/collector-staging-rust.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  rust-native-staging:
+    name: rust-native-tcp-staging-only
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out exact PR head with no persisted credentials
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Prove exact source HEAD
+        env:
+          EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          echo "Verified source commit: $EXPECTED_SHA"
+      - name: Select fixed Rust compiler version
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --component clippy
+          cargo +1.95.0 --version
+      - name: Execute real-TCP collector to exporter and negative cases
+        run: cargo +1.95.0 test --manifest-path staging/collector/Cargo.toml --all-targets
+      - name: Lint compiled targets
+        run: cargo +1.95.0 clippy --manifest-path staging/collector/Cargo.toml --all-targets -- -D warnings
