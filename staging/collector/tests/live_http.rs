@@ -3,7 +3,7 @@ use axum::{
     extract::State,
     http::{HeaderMap, StatusCode, Uri},
     routing::post,
-    Router,
+    Json, Router,
 };
 use ores_otel_collector_staging::{router, CollectorState};
 use reqwest::{Client, Url};
@@ -18,22 +18,30 @@ const EXPORT_BEARER: &str = "this-is-a-synthetic-test-export-bearer";
 struct ExportState {
     calls: Arc<Mutex<Vec<(String, String, Value)>>>,
     fail: bool,
+    partial: Option<Value>,
+    broken_receipt: bool,
 }
 async fn exported(
     State(state): State<ExportState>,
     uri: Uri, headers: HeaderMap, body: Bytes,
-) -> StatusCode {
+) -> (StatusCode, Json<Value>) {
     let tenant = headers.get("x-ores-tenant-id").and_then(|v| v.to_str().ok()).unwrap_or("");
     let auth = headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("");
     if tenant != "tenant_a" || auth != format!("Bearer {EXPORT_BEARER}") {
-        return StatusCode::UNAUTHORIZED;
+        return (StatusCode::UNAUTHORIZED, Json(json!({})));
     }
     let value = match serde_json::from_slice(&body) {
         Ok(v) => v,
-        Err(_) => return StatusCode::BAD_REQUEST,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(json!({}))),
     };
     state.calls.lock().unwrap().push((uri.path().into(), tenant.into(), value));
-    if state.fail { StatusCode::SERVICE_UNAVAILABLE } else { StatusCode::OK }
+    if state.fail {
+        (StatusCode::SERVICE_UNAVAILABLE, Json(json!({})))
+    } else if state.broken_receipt {
+        (StatusCode::OK, Json(json!({"unknown":"cannot infer a successful export"})))
+    } else {
+        (StatusCode::OK, Json(state.partial.clone().unwrap_or_else(|| json!({}))))
+    }
 }
 async fn serve(app: Router) -> (String, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -41,8 +49,10 @@ async fn serve(app: Router) -> (String, JoinHandle<()>) {
     let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
     (url, task)
 }
-async fn setup(fail: bool) -> (String, ExportState, JoinHandle<()>, JoinHandle<()>) {
-    let sink = ExportState { calls: Arc::new(Mutex::new(Vec::new())), fail };
+async fn setup_with_receipt(
+    fail: bool, partial: Option<Value>, broken_receipt: bool,
+) -> (String, ExportState, JoinHandle<()>, JoinHandle<()>) {
+    let sink = ExportState { calls: Arc::new(Mutex::new(Vec::new())), fail, partial, broken_receipt };
     let exporter = Router::new()
         .route("/v1/logs", post(exported))
         .route("/v1/traces", post(exported))
@@ -54,6 +64,9 @@ async fn setup(fail: bool) -> (String, ExportState, JoinHandle<()>, JoinHandle<(
     ).unwrap();
     let (url, collector_task) = serve(router(state)).await;
     (url, sink, export_task, collector_task)
+}
+async fn setup(fail: bool) -> (String, ExportState, JoinHandle<()>, JoinHandle<()>) {
+    setup_with_receipt(fail, None, false).await
 }
 fn event(signal: &str) -> Value {
     match signal {
@@ -131,4 +144,53 @@ fn rejects_insecure_remote_exporter_and_short_credentials() {
     let local = Url::parse("http://127.0.0.1:4318").unwrap();
     assert!(CollectorState::new("tenant_a".into(), CLIENT_BEARER.into(), remote, EXPORT_BEARER.into()).is_err());
     assert!(CollectorState::new("tenant_a".into(), "short".into(), local, EXPORT_BEARER.into()).is_err());
+}
+
+#[tokio::test]
+async fn real_tcp_partial_exporter_acceptance_preserves_no_retry_otlp_response() {
+    let partial = json!({"partialSuccess":{"rejectedSpans":1,"errorMessage":"customer-account-secret-value"}});
+    let (base, sink, exporter_task, collector_task) = setup_with_receipt(false, Some(partial), false).await;
+    let client = Client::new();
+    let response = send_otlp(&client, &base, "traces", Some(CLIENT_BEARER), event("traces").to_string()).await;
+    // OTLP partial success is HTTP 200, not 503: a 503 would provoke replay
+    // of spans already accepted by the downstream exporter.
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["partialSuccess"]["rejectedSpans"], "1");
+    assert_eq!(body["partialSuccess"]["errorMessage"], "upstream exporter warning or partial rejection");
+    assert!(!body.to_string().contains("customer-account-secret-value"));
+    assert_eq!(sink.calls.lock().unwrap().len(), 1);
+    exporter_task.abort();
+    collector_task.abort();
+}
+
+#[tokio::test]
+async fn real_tcp_unexpected_success_receipt_rejected_not_falsely_acked() {
+    let (base, sink, exporter_task, collector_task) = setup_with_receipt(false, None, true).await;
+    let client = Client::new();
+    let response = send_otlp(&client, &base, "metrics", Some(CLIENT_BEARER), event("metrics").to_string()).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(sink.calls.lock().unwrap().len(), 1);
+    exporter_task.abort();
+    collector_task.abort();
+}
+
+#[tokio::test]
+async fn real_tcp_denies_duplicate_authorization_header_and_resource_tenant_spoof() {
+    let (base, sink, exporter_task, collector_task) = setup(false).await;
+    let client = Client::new();
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.append("authorization", format!("Bearer {CLIENT_BEARER}").parse().unwrap());
+    headers.append("authorization", "Bearer malicious-token".parse().unwrap());
+    let response = client.post(format!("{base}/v1/logs"))
+        .headers(headers).header("content-type", "application/json")
+        .body(event("logs").to_string()).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let spoof = json!({"resourceLogs":[{"resource":{"attributes":[{"key":"tenant.id","value":{"stringValue":"other_tenant"}}]},
+        "scopeLogs":[{"logRecords":[{"body":{"stringValue":"some data"}}]}]}]});
+    let response = send_otlp(&client, &base, "logs", Some(CLIENT_BEARER), spoof.to_string()).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(sink.calls.lock().unwrap().is_empty());
+    exporter_task.abort();
+    collector_task.abort();
 }
