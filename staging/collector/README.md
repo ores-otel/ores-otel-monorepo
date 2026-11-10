@@ -1,0 +1,41 @@
+# OTLP/HTTP collector — UNRELEASED staging source
+
+This is a **temporary Rust source bootstrap** attached to an app-of-apps repository because the [dedicated collector repository](https://github.com/ores-otel/ores-otel-monorepo/issues/3) does not yet exist. **Do not deploy this as the ORES OTEL production collector or treat the monorepo as its permanent source home.** Extract reviewed code and tests into `ores-otel/ores-otel-collector.rs` before release. [Architecture ADR-0001](https://github.com/ores-otel/ores-otel-docs/blob/main/docs/architecture/0001-otel-collector-plane.md) is authoritative.
+
+## Supported narrow behavior
+
+- **Real HTTP listener** with `POST /v1/logs`, `POST /v1/traces`, `POST /v1/metrics`, `GET /healthz`, `GET /readyz`.
+- Receives **OTLP/HTTP JSON only** (not protobuf or gRPC). It performs minimal shape/size admission, not complete OTLP semantic-convention or protocol validation.
+- Uses an **ingest-only, static test bearer** to derive one configured tenant; client-provided `x-ores-tenant-id` is rejected. For production: replace the static bearer with authenticated, rotating workload/tenant identity and per-tenant quotas.
+- Body maximum 64 KiB, shallow structure limits, at most 256 signal records, at most eight in-flight exports, 3s exporter timeout and no network redirect. Rejects known secret-bearing attribute names before forwarding. This is **rejection**, not comprehensive policy-based secret redaction.
+- Forwards to exactly one **configured approved HTTPS endpoint** (or test loopback HTTP) with a separate export bearer and an authenticated `x-ores-tenant-id` header; no client-supplied destination accepted, redirects and ambient HTTP proxies disabled. Rejects duplicate authorization/content-type headers and tenant authority attributes.
+- The receiver relays successful exporter acceptance. A downstream OTLP HTTP 200 **with `partialSuccess`** is propagated as a sanitized **200 partial success**, not converted to 503: per OTLP, clients MUST NOT retry partial-success batches because some records may already have been accepted. An invalid successful exporter receipt fails with 502; other exporter failures and timeouts return 503. Neither 502 nor 503 proves that an upstream exporter accepted zero records. No durable queue, replay protection or retry is implemented.
+
+## Execution
+
+Requires Rust 1.95 and Cargo; the **committed `Cargo.lock`** pins 145 packages. Use `cargo +1.95.0 test --manifest-path staging/collector/Cargo.toml --locked --all-targets` and `cargo +1.95.0 clippy --manifest-path staging/collector/Cargo.toml --locked --all-targets -- -D warnings` to execute real-loopback-TCP and strict lint gates.
+
+Explicit local-only smoke configuration:
+
+```sh
+export ORES_OTEL_STAGING_BIND='127.0.0.1:4318'
+export ORES_OTEL_STAGING_TENANT='synthetic_test_tenant'
+export ORES_OTEL_STAGING_BEARER='<scoped-synthetic-ingest-test-token-24+ chars>'
+export ORES_OTEL_STAGING_EXPORTER='http://127.0.0.1:4319'
+export ORES_OTEL_STAGING_EXPORTER_BEARER='<independent-scoped-synthetic-export-test-token-24+ chars>'
+cargo run --manifest-path staging/collector/Cargo.toml
+```
+
+The exporter must be started separately on loopback. The production deployment must use workload identity and secret files/service-bound credentials; **do not commit tokens or expose the prototype to the Internet**.
+
+## Explicitly NOT IMPLEMENTED or NOT CERTIFIED
+
+- OTLP/gRPC, OTLP protobuf, gzip streaming/decompression/size budgets; full standard OTLP partial-success negotiation (only sanitized JSON partial-success rejection counts are supported); complete schema/semantic-convention validation.
+- Multi-tenant identity control plane, credential rotation, mTLS, workload binding, quota/rate budgets, exporter fan-out, per-tenant durability or long-term storage.
+- Complete redaction, retention, query APIs, indexes, analytics, dashboards, automatic instrumentation or Cloudflare Workers native telemetry integration.
+- Retry, persistent queue, shutdown drain, crash recovery, at-least-once/exactly-once delivery, exporter deduplication, secure metrics/health deployment.
+- AttoLang compiler-produced guest execution and Java/LLVM/Forge/Wasm/.NET parity.
+
+CI success here is **NATIVE_HOST_STAGING_ONLY**. For release, create the dedicated repository, review and retain the committed deterministic Cargo.lock, run negative controls with two real tenants, execute standard OTLP interoperability fixtures and independent export/storage read-back, and capture exact source SHA, stepful jobs and deployment digests.
+
+See [draft observability parity ADR](https://github.com/ores-otel/ores-otel-docs/pull/8) and [e2e OTLP admission gate](https://github.com/ores-otel/ores-otel-e2e/pull/8).
