@@ -155,7 +155,8 @@ async fn real_tcp_partial_exporter_acceptance_preserves_no_retry_otlp_response()
     // OTLP partial success is HTTP 200, not 503: a 503 would provoke replay
     // of spans already accepted by the downstream exporter.
     assert_eq!(response.status(), StatusCode::OK);
-    let body: Value = response.json().await.unwrap();
+    let bytes = response.bytes().await.unwrap();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(body["partialSuccess"]["rejectedSpans"], "1");
     assert_eq!(body["partialSuccess"]["errorMessage"], "upstream exporter warning or partial rejection");
     assert!(!body.to_string().contains("customer-account-secret-value"));
