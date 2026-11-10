@@ -34,8 +34,10 @@ impl CollectorState {
         if tenant.len() > 128 || tenant.is_empty() || !tenant.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_')) {
             return Err("invalid tenant identity");
         }
-        if bearer.len() < 24 || exporter_bearer.len() < 24 || bearer.chars().any(char::is_whitespace)
-            || exporter_bearer.chars().any(char::is_whitespace) {
+        if ![bearer.as_str(), exporter_bearer.as_str()].iter().all(|token| {
+            (24..=256).contains(&token.len())
+                && token.bytes().all(|byte| byte.is_ascii_graphic())
+        }) {
             return Err("test bearer configuration invalid");
         }
         if exporter.username() != "" || exporter.password().is_some() || exporter.query().is_some()
@@ -44,6 +46,7 @@ impl CollectorState {
             return Err("exporter must be HTTPS or loopback HTTP with no embedded credentials");
         }
         let http = Client::builder()
+            .no_proxy()
             .timeout(Duration::from_secs(3))
             .connect_timeout(Duration::from_secs(1))
             .redirect(Policy::none())
@@ -103,12 +106,20 @@ async fn ingest(
 ) -> (StatusCode, Json<Value>) {
     // Workload identity is derived only from the authenticated receiver credential.
     // A client-supplied tenant header cannot override or be forwarded as identity.
-    let auth = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or("");
-    if !constant_time_equal(auth, &format!("Bearer {}", state.expected_bearer)) {
+    let auth_values = headers.get_all(header::AUTHORIZATION);
+    if auth_values.iter().count() != 1 {
+        return denied(StatusCode::UNAUTHORIZED);
+    }
+    let auth = auth_values.iter().next().and_then(|v| v.to_str().ok()).unwrap_or("");
+    if auth.len() > 264 || !constant_time_equal(auth, &format!("Bearer {}", state.expected_bearer)) {
         return denied(StatusCode::UNAUTHORIZED);
     }
     if headers.contains_key("x-ores-tenant-id") {
         return denied(StatusCode::FORBIDDEN);
+    }
+    if headers.get_all(header::CONTENT_TYPE).iter().count() != 1
+        || headers.get_all(header::CONTENT_ENCODING).iter().count() > 1 {
+        return denied(StatusCode::UNSUPPORTED_MEDIA_TYPE);
     }
     let ct = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
     if !matches!(ct, "application/json" | "application/json; charset=utf-8") ||
@@ -147,56 +158,91 @@ async fn ingest(
         .send().await;
     match result {
         Ok(mut response) if response.status() == reqwest::StatusCode::OK => {
-            // A 200 may contain OTLP partial-success rejection. Do not acknowledge it.
-            // The exporter response body is also a bounded, untrusted input.
+            // Never trust an HTTP 200 as proof of full acceptance: OTLP partial
+            // success has 200 status, and must NOT trigger a retry of accepted data.
+            // Bound the complete exporter response before any JSON decoding.
+            let upstream_ct = response.headers().get(header::CONTENT_TYPE)
+                .and_then(|header| header.to_str().ok()).unwrap_or("");
+            let upstream_encoding = response.headers().get(header::CONTENT_ENCODING)
+                .and_then(|header| header.to_str().ok()).unwrap_or("identity");
+            if !matches!(upstream_encoding, "identity" | "") {
+                return denied(StatusCode::BAD_GATEWAY);
+            }
             let mut receipt = Vec::new();
             loop {
                 match response.chunk().await {
                     Ok(Some(chunk)) if receipt.len().saturating_add(chunk.len()) <= 8192 =>
                         receipt.extend_from_slice(&chunk),
                     Ok(None) => break,
-                    _ => return denied(StatusCode::SERVICE_UNAVAILABLE),
+                    _ => return denied(StatusCode::BAD_GATEWAY),
                 }
             }
-            if exporter_accepted(&receipt, signal) {
-                (StatusCode::OK, Json(json!({})))
-            } else {
-                denied(StatusCode::SERVICE_UNAVAILABLE)
+            if !receipt.is_empty() && !upstream_ct.to_ascii_lowercase().starts_with("application/json") {
+                return denied(StatusCode::BAD_GATEWAY);
+            }
+            match exporter_receipt(&receipt, signal) {
+                Some(None) => (StatusCode::OK, Json(json!({}))),
+                Some(Some(partial)) => {
+                    // Return only an approved partial-success count and an optional
+                    // fixed warning. No exporter diagnostics or tenant data leak.
+                    (StatusCode::OK, Json(json!({"partialSuccess": partial})))
+                }
+                None => denied(StatusCode::BAD_GATEWAY),
             }
         }
         _ => denied(StatusCode::SERVICE_UNAVAILABLE),
     }
 }
 
-fn exporter_accepted(receipt: &[u8], signal: &str) -> bool {
-    if receipt.is_empty() { return true; }
-    let Ok(message) = serde_json::from_slice::<Value>(receipt) else { return false; };
-    let Some(obj) = message.as_object() else { return false; };
-    let Some(partial) = obj.get("partialSuccess") else { return true; };
-    let Some(data) = partial.as_object() else { return false; };
+// Some(None) means full acceptance; Some(Some(_)) means an OTLP 200 partial
+// success, which is *not retryable*; None means a malformed exporter receipt.
+// The exact accepted count is never inferred from a 200 response alone.
+fn exporter_receipt(receipt: &[u8], signal: &str) -> Option<Option<Value>> {
+    if receipt.is_empty() {
+        return Some(None); // compatibility for test sinks without response bodies
+    }
+    let message: Value = serde_json::from_slice(receipt).ok()?;
+    let obj = message.as_object()?;
+    if obj.keys().any(|key| key != "partialSuccess") {
+        return None;
+    }
+    let Some(value) = obj.get("partialSuccess") else { return Some(None); };
+    let data = value.as_object()?;
     let rejected_name = match signal {
         "traces" => "rejectedSpans",
         "logs" => "rejectedLogRecords",
         "metrics" => "rejectedDataPoints",
-        _ => return false,
+        _ => return None,
     };
-    if let Some(rejected) = data.get(rejected_name) {
-        if !matches!(rejected, Value::Number(n) if n.as_u64() == Some(0))
-            && !matches!(rejected, Value::String(s) if s == "0") {
-            return false;
-        }
+    if data.keys().any(|key| key != rejected_name && key != "errorMessage") {
+        return None;
     }
-    if let Some(error) = data.get("errorMessage") {
-        if !matches!(error, Value::String(s) if s.is_empty()) {
-            return false;
-        }
+    let count = match data.get(rejected_name) {
+        None => 0,
+        Some(Value::Number(n)) => n.as_u64()?,
+        Some(Value::String(s)) if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) =>
+            s.parse::<u64>().ok()?,
+        _ => return None,
+    };
+    let warned = match data.get("errorMessage") {
+        None => false,
+        Some(Value::String(s)) if s.len() <= 1024 => !s.is_empty(),
+        _ => return None,
+    };
+    if !data.contains_key(rejected_name) && !warned {
+        return None;
     }
-    true
+    let mut output = serde_json::Map::new();
+    output.insert(rejected_name.to_owned(), Value::String(count.to_string()));
+    if warned {
+        output.insert("errorMessage".into(), Value::String("upstream exporter warning or partial rejection".into()));
+    }
+    Some(Some(Value::Object(output)))
 }
 
 fn forbidden_attribute(key: &str) -> bool {
     let k = key.to_ascii_lowercase();
-    ["password", "authorization", "cookie", "secret", "credential", "api_key", "private_key", "access_token", "refresh_token"]
+    ["password", "authorization", "cookie", "secret", "credential", "api_key", "apikey", "private_key", "access_token", "refresh_token", "set-cookie", "bearer", "tenant.id", "tenant_id", "tenantid", "x-ores-tenant", "ores.tenant", "organization.id", "org.id", "billing.account"]
         .iter().any(|needle| k.contains(needle))
 }
 
@@ -228,6 +274,8 @@ fn valid_payload(value: &Value, signal: &str) -> bool {
         "metrics" => ("resourceMetrics", "scopeMetrics", "metrics"),
         _ => return false,
     };
+    let Some(payload) = value.as_object() else { return false; };
+    if payload.len() != 1 || !payload.contains_key(root) { return false; }
     let Some(resources) = value.get(root).and_then(Value::as_array) else { return false; };
     if resources.is_empty() || resources.len() > 16 { return false; }
     let mut records = 0;
@@ -261,15 +309,32 @@ fn valid_span(value: &Value) -> bool {
 mod tests {
     use super::*;
     #[test]
-    fn refuse_partial_exporter_acknowledgments() {
-        assert!(exporter_accepted(b"{}", "logs"));
-        assert!(exporter_accepted(b"", "logs"));
-        assert!(exporter_accepted(br#"{"partialSuccess":{"rejectedSpans":0}}"#, "traces"));
-        assert!(!exporter_accepted(br#"{"partialSuccess":{"rejectedSpans":1}}"#, "traces"));
-        assert!(!exporter_accepted(br#"{"partialSuccess":{"rejectedLogRecords":"2"}}"#, "logs"));
-        assert!(!exporter_accepted(br#"{"partialSuccess":{"rejectedDataPoints":1}}"#, "metrics"));
-        assert!(!exporter_accepted(br#"{"partialSuccess":{"errorMessage":"partial failure"}}"#, "logs"));
-        assert!(!exporter_accepted(b"not-json", "traces"));
+    fn preserves_sanitized_otlp_partial_success_without_retries() {
+        assert_eq!(exporter_receipt(b"{}", "logs"), Some(None));
+        assert_eq!(exporter_receipt(b"", "logs"), Some(None));
+        assert_eq!(
+            exporter_receipt(br#"{"partialSuccess":{"rejectedSpans":2,"errorMessage":"private detail"}}"#, "traces"),
+            Some(Some(json!({"rejectedSpans":"2","errorMessage":"upstream exporter warning or partial rejection"})))
+        );
+        assert_eq!(
+            exporter_receipt(br#"{"partialSuccess":{"rejectedLogRecords":"1"}}"#, "logs"),
+            Some(Some(json!({"rejectedLogRecords":"1"})))
+        );
+        assert_eq!(
+            exporter_receipt(br#"{"partialSuccess":{"rejectedDataPoints":0,"errorMessage":"warning"}}"#, "metrics"),
+            Some(Some(json!({"rejectedDataPoints":"0","errorMessage":"upstream exporter warning or partial rejection"})))
+        );
+        for invalid in [
+            br#"{"partialSuccess":{"rejectedSpans":-1}}"#.as_slice(),
+            br#"{"partialSuccess":{"rejectedSpans":"wat"}}"#,
+            br#"{"partialSuccess":{"rejectedLogRecords":1}}"#,
+            br#"{"partialSuccess":{"errorMessage":""}}"#,
+            br#"{"partialSuccess":{"rejectedSpans":1,"wrong":2}}"#,
+            br#"{"other":1}"#,
+            b"not-json",
+        ] {
+            assert_eq!(exporter_receipt(invalid, "traces"), None);
+        }
     }
     #[test]
     fn reject_secret_and_unbounded_payloads() {
