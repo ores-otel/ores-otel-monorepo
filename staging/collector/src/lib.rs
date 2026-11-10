@@ -146,10 +146,52 @@ async fn ingest(
         .body(body)
         .send().await;
     match result {
-        Ok(response) if response.status() == reqwest::StatusCode::OK =>
-            (StatusCode::OK, Json(json!({}))),
+        Ok(mut response) if response.status() == reqwest::StatusCode::OK => {
+            // A 200 may contain OTLP partial-success rejection. Do not acknowledge it.
+            // The exporter response body is also a bounded, untrusted input.
+            let mut receipt = Vec::new();
+            loop {
+                match response.chunk().await {
+                    Ok(Some(chunk)) if receipt.len().saturating_add(chunk.len()) <= 8192 =>
+                        receipt.extend_from_slice(&chunk),
+                    Ok(None) => break,
+                    _ => return denied(StatusCode::SERVICE_UNAVAILABLE),
+                }
+            }
+            if exporter_accepted(&receipt, signal) {
+                (StatusCode::OK, Json(json!({})))
+            } else {
+                denied(StatusCode::SERVICE_UNAVAILABLE)
+            }
+        }
         _ => denied(StatusCode::SERVICE_UNAVAILABLE),
     }
+}
+
+fn exporter_accepted(receipt: &[u8], signal: &str) -> bool {
+    if receipt.is_empty() { return true; }
+    let Ok(message) = serde_json::from_slice::<Value>(receipt) else { return false; };
+    let Some(obj) = message.as_object() else { return false; };
+    let Some(partial) = obj.get("partialSuccess") else { return true; };
+    let Some(data) = partial.as_object() else { return false; };
+    let rejected_name = match signal {
+        "traces" => "rejectedSpans",
+        "logs" => "rejectedLogRecords",
+        "metrics" => "rejectedDataPoints",
+        _ => return false,
+    };
+    if let Some(rejected) = data.get(rejected_name) {
+        if !matches!(rejected, Value::Number(n) if n.as_u64() == Some(0))
+            && !matches!(rejected, Value::String(s) if s == "0") {
+            return false;
+        }
+    }
+    if let Some(error) = data.get("errorMessage") {
+        if !matches!(error, Value::String(s) if s.is_empty()) {
+            return false;
+        }
+    }
+    true
 }
 
 fn forbidden_attribute(key: &str) -> bool {
@@ -218,6 +260,17 @@ fn valid_span(value: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn refuse_partial_exporter_acknowledgments() {
+        assert!(exporter_accepted(b"{}", "logs"));
+        assert!(exporter_accepted(b"", "logs"));
+        assert!(exporter_accepted(br#"{"partialSuccess":{"rejectedSpans":0}}"#, "traces"));
+        assert!(!exporter_accepted(br#"{"partialSuccess":{"rejectedSpans":1}}"#, "traces"));
+        assert!(!exporter_accepted(br#"{"partialSuccess":{"rejectedLogRecords":"2"}}"#, "logs"));
+        assert!(!exporter_accepted(br#"{"partialSuccess":{"rejectedDataPoints":1}}"#, "metrics"));
+        assert!(!exporter_accepted(br#"{"partialSuccess":{"errorMessage":"partial failure"}}"#, "logs"));
+        assert!(!exporter_accepted(b"not-json", "traces"));
+    }
     #[test]
     fn reject_secret_and_unbounded_payloads() {
         let base = json!({"resourceLogs":[{"scopeLogs":[{"logRecords":[{"body":{"stringValue":"synthetic"}}]}]}]});
