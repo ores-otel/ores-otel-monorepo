@@ -31,12 +31,6 @@ jobs:
           rustup toolchain install 1.95.0 --profile minimal --component clippy
           cargo +1.95.0 --version
       - name: Execute real-TCP collector to exporter and negative cases
-        run: cargo +1.95.0 test --manifest-path staging/collector/Cargo.toml --all-targets
+        run: cargo +1.95.0 test --manifest-path staging/collector/Cargo.toml --locked --all-targets
       - name: Lint compiled targets
-        run: cargo +1.95.0 clippy --manifest-path staging/collector/Cargo.toml --all-targets -- -D warnings
-      - name: Review generated staging dependency lock candidate
-        run: |
-          test -f staging/collector/Cargo.lock
-          echo 'ORES_LOCK_BEGIN'
-          awk '{print "ORES_LOCK: "$0}' staging/collector/Cargo.lock
-          echo 'ORES_LOCK_END'
+        run: cargo +1.95.0 clippy --manifest-path staging/collector/Cargo.toml --locked --all-targets -- -D warnings
